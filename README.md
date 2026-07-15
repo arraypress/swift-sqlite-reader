@@ -4,10 +4,10 @@ A tiny, zero-dependency wrapper over the system `libsqlite3` for **reading and i
 
 ## Features
 
-- 🗄️ **Open a file** read-write (falling back to read-only) with `SQLiteDB(url:)`
+- 🗄️ **Open a file** read-write (falling back to read-only, flagged via `readOnly`) with `SQLiteDB(url:)` — never creates a missing database
 - 🧠 **Or an in-memory DB from DDL** with `SQLiteDB(sql:)` — visualize a `schema.sql` with no file
 - 🔎 **Introspection** — `tables()`, `schema(_:)` (columns, PK, NOT NULL), `foreignKeys(_:)`, `rowCount(_:)`
-- ▶️ **Ad-hoc queries** — `run(_:limit:)` returns stringified rows or an error, row-capped for display safety
+- ▶️ **Ad-hoc queries** — `run(_:limit:)` returns a `SQLiteDB.Result` (columns, stringified rows, `error`, `rowsAffected`), row-capped for display safety
 - 🧱 **Safe identifiers** — table/column names are quote-escaped internally
 - 🪶 **Zero dependencies** — Foundation + the system `libsqlite3` (auto-linked via `import SQLite3`)
 - 🍎 **Cross-platform** — iOS, macOS, tvOS, watchOS, visionOS

@@ -23,6 +23,7 @@ public extension SQLiteDB {
         /// The referenced column (empty for an implicit primary-key reference).
         public let toColumn: String
 
+        /// Memberwise initializer. Foreign keys are normally produced by ``SQLiteDB/foreignKeys(_:)``.
         public init(from: String, toTable: String, toColumn: String) {
             self.from = from
             self.toTable = toTable

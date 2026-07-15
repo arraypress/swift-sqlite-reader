@@ -26,6 +26,7 @@ public extension SQLiteDB {
         /// Whether the column has a `NOT NULL` constraint.
         public let notNull: Bool
 
+        /// Memberwise initializer. Columns are normally produced by ``SQLiteDB/schema(_:)``.
         public init(name: String, type: String, pk: Bool, notNull: Bool) {
             self.name = name
             self.type = type

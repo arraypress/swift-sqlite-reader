@@ -120,6 +120,8 @@ public final class SQLiteDB {
     /// Runs one SQL statement. Rows are capped at `limit` for display safety.
     ///
     /// - Returns: a ``Result`` with stringified rows, or an error message on failure.
+    /// - Note: Blocking — executes synchronously on the calling thread. Runs *any* SQL,
+    ///   including writes, when the database was opened read-write (check ``readOnly``).
     public func run(_ sql: String, limit: Int = 2000) -> Result {
         guard let db else { return Result(columns: [], rows: [], error: "No database", rowsAffected: 0) }
         var stmt: OpaquePointer?
@@ -160,5 +162,6 @@ public final class SQLiteDB {
         return Result(columns: columns, rows: rows, error: stepError, rowsAffected: affected)
     }
 
+    /// Double-quotes an identifier (escaping embedded quotes) for safe interpolation into SQL/pragma text.
     private func quoteIdent(_ s: String) -> String { "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" }
 }

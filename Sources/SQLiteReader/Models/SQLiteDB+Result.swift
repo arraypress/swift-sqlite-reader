@@ -27,6 +27,7 @@ public extension SQLiteDB {
         /// The number of rows changed by the statement (for INSERT/UPDATE/DELETE).
         public let rowsAffected: Int
 
+        /// Memberwise initializer. Results are normally produced by ``SQLiteDB/run(_:limit:)``.
         public init(columns: [String], rows: [[String]], error: String?, rowsAffected: Int) {
             self.columns = columns
             self.rows = rows
