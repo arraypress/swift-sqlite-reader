@@ -39,6 +39,8 @@ public final class SQLiteDB {
         var handle: OpaquePointer?
         if sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READWRITE, nil) == SQLITE_OK {
             db = handle; readOnly = false
+            // Retry briefly instead of failing instantly when another process holds a lock.
+            sqlite3_busy_timeout(handle, 250)
             return
         }
         // A failed open still allocates a connection that must be closed before retrying.
@@ -46,6 +48,7 @@ public final class SQLiteDB {
         handle = nil
         if sqlite3_open_v2(url.path, &handle, SQLITE_OPEN_READONLY, nil) == SQLITE_OK {
             db = handle; readOnly = true
+            sqlite3_busy_timeout(handle, 250)
             return
         }
         if let handle { sqlite3_close(handle) }
@@ -94,12 +97,24 @@ public final class SQLiteDB {
     /// Foreign keys declared on `table` (via `PRAGMA foreign_key_list`).
     public func foreignKeys(_ table: String) -> [ForeignKey] {
         // columns: id, seq, table, from, to, on_update, on_delete, match
-        let r = run("PRAGMA foreign_key_list(\(quoteIdent(table)))")
-        return r.rows.compactMap { row in
-            guard row.count >= 5 else { return nil }
-            // A NULL "to" (implicit PK reference like `REFERENCES parent`) stringifies to "NULL".
-            return ForeignKey(from: row[3], toTable: row[2], toColumn: row[4] == "NULL" ? "" : row[4])
+        // Read the pragma with a typed statement: an implicit PK reference (`REFERENCES parent`)
+        // yields an actual SQL NULL "to", which must not be confused with a parent column
+        // literally named "NULL" (the stringified `run()` result can't tell them apart).
+        guard let db else { return [] }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, "PRAGMA foreign_key_list(\(quoteIdent(table)))", -1, &stmt, nil) == SQLITE_OK else {
+            return []
         }
+        defer { sqlite3_finalize(stmt) }
+        var fks: [ForeignKey] = []
+        while sqlite3_step(stmt) == SQLITE_ROW {
+            let toTable = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? ""
+            let from = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? ""
+            let toColumn = sqlite3_column_type(stmt, 4) == SQLITE_NULL
+                ? "" : (sqlite3_column_text(stmt, 4).map { String(cString: $0) } ?? "")
+            fks.append(ForeignKey(from: from, toTable: toTable, toColumn: toColumn))
+        }
+        return fks
     }
 
     /// Runs one SQL statement. Rows are capped at `limit` for display safety.
@@ -118,7 +133,8 @@ public final class SQLiteDB {
         for i in 0..<colCount { columns.append(String(cString: sqlite3_column_name(stmt, Int32(i)))) }
 
         var rows: [[String]] = []
-        while sqlite3_step(stmt) == SQLITE_ROW {
+        var rc = sqlite3_step(stmt)
+        while rc == SQLITE_ROW {
             var row: [String] = []
             for i in 0..<colCount {
                 let c = Int32(i)
@@ -132,8 +148,16 @@ public final class SQLiteDB {
             }
             rows.append(row)
             if rows.count >= limit { break }
+            rc = sqlite3_step(stmt)
         }
-        return Result(columns: columns, rows: rows, error: nil, rowsAffected: Int(sqlite3_changes(db)))
+        // rc == SQLITE_ROW here means we stopped at the display limit; anything other than
+        // SQLITE_DONE (BUSY, CORRUPT, runtime errors mid-iteration) must be surfaced, not
+        // silently returned as a complete-looking result.
+        let stepError = (rc == SQLITE_DONE || rc == SQLITE_ROW) ? nil : String(cString: sqlite3_errmsg(db))
+        // sqlite3_changes reports the last write on the connection and is NOT reset by
+        // read-only statements — only report it for statements that can actually write.
+        let affected = sqlite3_stmt_readonly(stmt) != 0 ? 0 : Int(sqlite3_changes(db))
+        return Result(columns: columns, rows: rows, error: stepError, rowsAffected: affected)
     }
 
     private func quoteIdent(_ s: String) -> String { "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" }

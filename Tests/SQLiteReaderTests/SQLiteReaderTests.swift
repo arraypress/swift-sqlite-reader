@@ -72,7 +72,40 @@ final class SQLiteReaderTests: XCTestCase {
     func testRunHonorsRowLimit() throws {
         let db = try XCTUnwrap(SQLiteDB(sql:
             "CREATE TABLE t (n); INSERT INTO t VALUES (1),(2),(3),(4),(5);"))
-        XCTAssertEqual(db.run("SELECT * FROM t", limit: 3).rows.count, 3)
+        let r = db.run("SELECT * FROM t", limit: 3)
+        XCTAssertEqual(r.rows.count, 3)
+        XCTAssertNil(r.error)   // stopping at the display limit is not an error
+    }
+
+    func testStepTimeErrorIsSurfaced() throws {
+        // abs() of the most negative integer raises a runtime "integer overflow" at
+        // step time (prepare succeeds) — it must not look like a successful empty result.
+        let db = try XCTUnwrap(SQLiteDB(sql:
+            "CREATE TABLE t (n INTEGER); INSERT INTO t VALUES (-9223372036854775808);"))
+        let r = db.run("SELECT abs(n) FROM t")
+        XCTAssertNotNil(r.error)
+    }
+
+    func testRowsAffectedIsZeroForReadOnlyStatements() throws {
+        // sqlite3_changes reports the last write on the connection; a SELECT after a
+        // DELETE must not inherit the DELETE's count.
+        let db = try XCTUnwrap(SQLiteDB(sql:
+            "CREATE TABLE t (n); INSERT INTO t VALUES (1),(2),(3);"))
+        XCTAssertEqual(db.run("DELETE FROM t WHERE n < 3").rowsAffected, 2)
+        XCTAssertEqual(db.run("SELECT * FROM t").rowsAffected, 0)
+    }
+
+    func testForeignKeyToColumnLiterallyNamedNULL() throws {
+        // An explicit reference to a parent column named "NULL" must not be collapsed
+        // into an implicit-PK reference (SQL NULL "to" in PRAGMA foreign_key_list).
+        let db = try XCTUnwrap(SQLiteDB(sql: """
+            CREATE TABLE p ("NULL" INTEGER PRIMARY KEY);
+            CREATE TABLE c (x REFERENCES p("NULL"));
+            CREATE TABLE q (id INTEGER PRIMARY KEY);
+            CREATE TABLE d (y REFERENCES q);
+        """))
+        XCTAssertEqual(db.foreignKeys("c").first?.toColumn, "NULL")   // explicit column
+        XCTAssertEqual(db.foreignKeys("d").first?.toColumn, "")       // implicit PK reference
     }
 
     func testIdentifierQuotingSurvivesSpecialTableName() throws {
@@ -98,6 +131,32 @@ final class SQLiteReaderTests: XCTestCase {
         XCTAssertFalse(db.readOnly)
         XCTAssertEqual(db.tables(), ["t"])
         XCTAssertEqual(db.rowCount("t"), 1)
+    }
+
+    func testLockedDatabaseSurfacesErrorInsteadOfEmptyResult() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("sqlitereader-\(UUID().uuidString).db")
+        defer { try? FileManager.default.removeItem(at: url) }
+
+        var h: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &h, SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, nil), SQLITE_OK)
+        sqlite3_exec(h, "CREATE TABLE t (a); INSERT INTO t VALUES (1),(2);", nil, nil, nil)
+        sqlite3_close(h)
+
+        let db = try XCTUnwrap(SQLiteDB(url: url))
+        XCTAssertEqual(db.tables(), ["t"])   // warm the schema cache so prepare succeeds later
+
+        // A second connection holds an exclusive write lock (the terminal agent mid-write).
+        var locker: OpaquePointer?
+        XCTAssertEqual(sqlite3_open_v2(url.path, &locker, SQLITE_OPEN_READWRITE, nil), SQLITE_OK)
+        defer { sqlite3_close(locker) }
+        XCTAssertEqual(sqlite3_exec(locker, "BEGIN EXCLUSIVE; INSERT INTO t VALUES (3);", nil, nil, nil), SQLITE_OK)
+
+        // SQLITE_BUSY at step time must surface as an error, not a clean empty result.
+        let r = db.run("SELECT * FROM t")
+        XCTAssertNotNil(r.error)
+
+        sqlite3_exec(locker, "ROLLBACK;", nil, nil, nil)
     }
 
     func testNonexistentFileReturnsNil() {
