@@ -115,6 +115,81 @@ final class SQLiteReaderTests: XCTestCase {
         XCTAssertEqual(db.schema("we ird").map(\.name), ["a"])
     }
 
+    // MARK: - Parameterized execution (execute)
+
+    func testExecuteBindsTypedParameters() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (i INTEGER, f REAL, s TEXT, n);"))
+        let w = db.execute("INSERT INTO t VALUES (?, ?, ?, ?)",
+                           parameters: [.integer(7), .real(1.5), .text("hi"), nil])
+        XCTAssertNil(w.error)
+        XCTAssertEqual(w.rowsAffected, 1)
+        XCTAssertEqual(db.run("SELECT i, f, s, n FROM t").rows.first, ["7", "1.5", "hi", "NULL"])
+    }
+
+    func testExecuteSelectWithParametersReturnsRows() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (n); INSERT INTO t VALUES (1),(2),(3);"))
+        let r = db.execute("SELECT n FROM t WHERE n > ? ORDER BY n", parameters: [.integer(1)])
+        XCTAssertNil(r.error)
+        XCTAssertEqual(r.rows.map { $0[0] }, ["2", "3"])
+        XCTAssertEqual(r.rowsAffected, 0)   // reads never inherit a write count
+    }
+
+    func testExecuteUpdateByRowid() throws {
+        // The cell-edit shape: UPDATE <table> SET <col> = ? WHERE rowid = ?
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (name TEXT); INSERT INTO t VALUES ('a'),('b');"))
+        let r = db.execute("UPDATE t SET name = ? WHERE rowid = ?", parameters: [.text("z"), .integer(2)])
+        XCTAssertNil(r.error)
+        XCTAssertEqual(r.rowsAffected, 1)
+        XCTAssertEqual(db.run("SELECT name FROM t ORDER BY rowid").rows.map { $0[0] }, ["a", "z"])
+    }
+
+    func testExecuteNeverInterpretsValueAsSQL() throws {
+        // A bound value must stay a literal — no string interpolation into the SQL.
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (s TEXT);"))
+        let hostile = "x'); DROP TABLE t;--"
+        XCTAssertNil(db.execute("INSERT INTO t VALUES (?)", parameters: [.text(hostile)]).error)
+        XCTAssertEqual(db.tables(), ["t"])                                    // still here
+        XCTAssertEqual(db.run("SELECT s FROM t").rows.first?.first, hostile)  // stored verbatim
+    }
+
+    func testExecuteParameterCountMismatchErrors() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (a, b);"))
+        XCTAssertNotNil(db.execute("INSERT INTO t VALUES (?, ?)", parameters: [.integer(1)]).error)
+        XCTAssertNotNil(db.execute("INSERT INTO t VALUES (?, ?)",
+                                   parameters: [.integer(1), .integer(2), .integer(3)]).error)
+        XCTAssertEqual(db.rowCount("t"), 0)   // neither mismatched statement executed
+    }
+
+    func testExecuteBindsBlobIncludingEmpty() throws {
+        // Empty Data must bind a genuine zero-length blob, not SQL NULL
+        // (sqlite3_bind_blob with a NULL pointer would bind NULL).
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (d BLOB);"))
+        XCTAssertNil(db.execute("INSERT INTO t VALUES (?)", parameters: [.blob(Data([1, 2, 3]))]).error)
+        XCTAssertNil(db.execute("INSERT INTO t VALUES (?)", parameters: [.blob(Data())]).error)
+        XCTAssertEqual(db.run("SELECT d FROM t ORDER BY rowid").rows.map { $0[0] },
+                       ["‹blob 3b›", "‹blob 0b›"])
+    }
+
+    func testExecuteHonorsRowLimit() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (n); INSERT INTO t VALUES (1),(2),(3),(4);"))
+        let r = db.execute("SELECT * FROM t WHERE n > ?", parameters: [.integer(0)], limit: 2)
+        XCTAssertNil(r.error)
+        XCTAssertEqual(r.rows.count, 2)
+    }
+
+    func testLastInsertRowID() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (a);"))
+        XCTAssertNil(db.execute("INSERT INTO t DEFAULT VALUES").error)   // the + Row shape
+        XCTAssertEqual(db.lastInsertRowID, 1)
+        XCTAssertNil(db.execute("INSERT INTO t DEFAULT VALUES").error)
+        XCTAssertEqual(db.lastInsertRowID, 2)
+    }
+
+    func testQuoteIdentifierEscapesEmbeddedQuotes() {
+        XCTAssertEqual(SQLiteDB.quoteIdentifier("plain"), "\"plain\"")
+        XCTAssertEqual(SQLiteDB.quoteIdentifier(#"we"ird"#), #""we""ird""#)
+    }
+
     // MARK: - File-backed (init?(url:))
 
     func testOpensExistingFileReadWrite() throws {

@@ -122,6 +122,8 @@ public final class SQLiteDB {
     /// - Returns: a ``Result`` with stringified rows, or an error message on failure.
     /// - Note: Blocking — executes synchronously on the calling thread. Runs *any* SQL,
     ///   including writes, when the database was opened read-write (check ``readOnly``).
+    ///   Values must be baked into the SQL text; for anything carrying user-supplied
+    ///   values, use ``execute(_:parameters:limit:)`` instead.
     public func run(_ sql: String, limit: Int = 2000) -> Result {
         guard let db else { return Result(columns: [], rows: [], error: "No database", rowsAffected: 0) }
         var stmt: OpaquePointer?
@@ -129,7 +131,77 @@ public final class SQLiteDB {
             return Result(columns: [], rows: [], error: String(cString: sqlite3_errmsg(db)), rowsAffected: 0)
         }
         defer { sqlite3_finalize(stmt) }
+        return collect(stmt!, on: db, limit: limit)
+    }
 
+    /// Runs one *parameterized* SQL statement, binding `parameters` positionally
+    /// (`?` placeholders, 1-based under the hood) with the proper `sqlite3_bind_*`
+    /// call per ``Value`` case — values are never interpolated into the SQL text.
+    ///
+    /// ```swift
+    /// db.execute("UPDATE \(SQLiteDB.quoteIdentifier(table)) SET name = ? WHERE rowid = ?",
+    ///            parameters: [.text("Ada"), .integer(3)])
+    /// ```
+    ///
+    /// - Parameter parameters: one entry per placeholder; `nil` binds SQL `NULL`.
+    ///   A count mismatch against the statement's placeholders is an error (the
+    ///   statement is not executed).
+    /// - Returns: a ``Result`` exactly like ``run(_:limit:)`` — parameterized
+    ///   SELECTs return rows; writes report ``Result/rowsAffected``.
+    /// - Note: Blocking — executes synchronously on the calling thread.
+    @discardableResult
+    public func execute(_ sql: String, parameters: [Value?] = [], limit: Int = 2000) -> Result {
+        guard let db else { return Result(columns: [], rows: [], error: "No database", rowsAffected: 0) }
+        var stmt: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
+            return Result(columns: [], rows: [], error: String(cString: sqlite3_errmsg(db)), rowsAffected: 0)
+        }
+        defer { sqlite3_finalize(stmt) }
+
+        let expected = Int(sqlite3_bind_parameter_count(stmt))
+        guard parameters.count == expected else {
+            return Result(columns: [], rows: [],
+                          error: "SQL expects \(expected) parameter\(expected == 1 ? "" : "s") but \(parameters.count) provided",
+                          rowsAffected: 0)
+        }
+        for (i, p) in parameters.enumerated() {
+            let idx = Int32(i + 1)
+            let rc: Int32
+            switch p {
+            case .none:
+                rc = sqlite3_bind_null(stmt, idx)
+            case .some(.integer(let v)):
+                rc = sqlite3_bind_int64(stmt, idx, v)
+            case .some(.real(let v)):
+                rc = sqlite3_bind_double(stmt, idx, v)
+            case .some(.text(let s)):
+                // Explicit byte length preserves embedded NULs; SQLITE_TRANSIENT copies
+                // the buffer (the bridged pointer dies at the end of the call).
+                rc = sqlite3_bind_text(stmt, idx, s, Int32(s.utf8.count), Self.transient)
+            case .some(.blob(let d)):
+                // bind_blob with a NULL base pointer binds SQL NULL — an empty Data
+                // must instead bind a genuine zero-length blob.
+                rc = d.isEmpty
+                    ? sqlite3_bind_zeroblob(stmt, idx, 0)
+                    : d.withUnsafeBytes { sqlite3_bind_blob(stmt, idx, $0.baseAddress, Int32(d.count), Self.transient) }
+            }
+            guard rc == SQLITE_OK else {
+                return Result(columns: [], rows: [], error: String(cString: sqlite3_errmsg(db)), rowsAffected: 0)
+            }
+        }
+        return collect(stmt!, on: db, limit: limit)
+    }
+
+    /// The rowid of the most recent successful `INSERT` on this connection
+    /// (`sqlite3_last_insert_rowid`); `0` if nothing was inserted yet.
+    public var lastInsertRowID: Int64 { db.map { sqlite3_last_insert_rowid($0) } ?? 0 }
+
+    /// `SQLITE_TRANSIENT` — tells SQLite to copy bound text/blob buffers immediately.
+    private static let transient = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
+
+    /// Steps a prepared statement to completion, stringifying rows (capped at `limit`)
+    /// — the shared back half of ``run(_:limit:)`` and ``execute(_:parameters:limit:)``.
+    private func collect(_ stmt: OpaquePointer, on db: OpaquePointer, limit: Int) -> Result {
         let colCount = Int(sqlite3_column_count(stmt))
         var columns: [String] = []
         for i in 0..<colCount { columns.append(String(cString: sqlite3_column_name(stmt, Int32(i)))) }
@@ -162,6 +234,12 @@ public final class SQLiteDB {
         return Result(columns: columns, rows: rows, error: stepError, rowsAffected: affected)
     }
 
-    /// Double-quotes an identifier (escaping embedded quotes) for safe interpolation into SQL/pragma text.
-    private func quoteIdent(_ s: String) -> String { "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" }
+    /// Double-quotes an identifier (escaping embedded quotes) for safe interpolation
+    /// into SQL/pragma text. Identifiers (table/column names) cannot be bound as
+    /// parameters — quote them with this and bind the *values* via
+    /// ``execute(_:parameters:limit:)``.
+    public static func quoteIdentifier(_ s: String) -> String { "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" }
+
+    /// Instance shorthand for ``quoteIdentifier(_:)`` used by the introspection helpers.
+    private func quoteIdent(_ s: String) -> String { Self.quoteIdentifier(s) }
 }
