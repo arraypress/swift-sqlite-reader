@@ -21,7 +21,7 @@ A tiny, zero-dependency wrapper over the system `libsqlite3` for **reading and i
 
 ```swift
 dependencies: [
-    .package(url: "https://github.com/arraypress/swift-sqlite-reader.git", from: "1.0.0")
+    .package(url: "https://github.com/Sidewatch/swift-sqlite-reader.git", from: "1.0.0")
 ]
 ```
 
