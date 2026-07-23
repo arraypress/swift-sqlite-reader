@@ -117,7 +117,13 @@ public final class SQLiteDB {
         return fks
     }
 
-    /// Runs one SQL statement. Rows are capped at `limit` for display safety.
+    /// Runs SQL — a single statement or a `;`-separated script. Rows are capped at
+    /// `limit` for display safety.
+    ///
+    /// A script executes every statement in order, stopping at the first error. The
+    /// returned rows come from the *last* statement that produced columns (so
+    /// `UPDATE …; SELECT …` shows the SELECT), and ``Result/rowsAffected`` totals
+    /// the writes across all statements.
     ///
     /// - Returns: a ``Result`` with stringified rows, or an error message on failure.
     /// - Note: Blocking — executes synchronously on the calling thread. Runs *any* SQL,
@@ -126,12 +132,36 @@ public final class SQLiteDB {
     ///   values, use ``execute(_:parameters:limit:)`` instead.
     public func run(_ sql: String, limit: Int = 2000) -> Result {
         guard let db else { return Result(columns: [], rows: [], error: "No database", rowsAffected: 0) }
-        var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return Result(columns: [], rows: [], error: String(cString: sqlite3_errmsg(db)), rowsAffected: 0)
+        var last: Result?
+        var lastWithColumns: Result?
+        var failure: Result?
+        var totalAffected = 0
+        sql.withCString { (base: UnsafePointer<CChar>) in
+            var cursor: UnsafePointer<CChar>? = base
+            while let current = cursor, current.pointee != 0 {
+                var stmt: OpaquePointer?
+                var tail: UnsafePointer<CChar>?
+                guard sqlite3_prepare_v2(db, current, -1, &stmt, &tail) == SQLITE_OK else {
+                    failure = Result(columns: [], rows: [], error: String(cString: sqlite3_errmsg(db)), rowsAffected: totalAffected)
+                    return
+                }
+                cursor = tail
+                // Whitespace/comment-only text prepares to a nil statement.
+                guard let stmt else { continue }
+                let r = collect(stmt, on: db, limit: limit)
+                sqlite3_finalize(stmt)
+                totalAffected += r.rowsAffected
+                if r.error != nil {
+                    failure = Result(columns: r.columns, rows: r.rows, error: r.error, rowsAffected: totalAffected)
+                    return
+                }
+                last = r
+                if !r.columns.isEmpty { lastWithColumns = r }
+            }
         }
-        defer { sqlite3_finalize(stmt) }
-        return collect(stmt!, on: db, limit: limit)
+        if let failure { return failure }
+        let shown = lastWithColumns ?? last ?? Result(columns: [], rows: [], error: nil, rowsAffected: 0)
+        return Result(columns: shown.columns, rows: shown.rows, error: nil, rowsAffected: totalAffected)
     }
 
     /// Runs one *parameterized* SQL statement, binding `parameters` positionally
@@ -148,15 +178,45 @@ public final class SQLiteDB {
     ///   statement is not executed).
     /// - Returns: a ``Result`` exactly like ``run(_:limit:)`` — parameterized
     ///   SELECTs return rows; writes report ``Result/rowsAffected``.
-    /// - Note: Blocking — executes synchronously on the calling thread.
+    /// - Note: Blocking — executes synchronously on the calling thread. Runs exactly
+    ///   ONE statement — positional parameters can't be split across a script, so
+    ///   trailing statements are an error, not silently dropped (use ``run(_:limit:)``
+    ///   for scripts).
     @discardableResult
     public func execute(_ sql: String, parameters: [Value?] = [], limit: Int = 2000) -> Result {
         guard let db else { return Result(columns: [], rows: [], error: "No database", rowsAffected: 0) }
         var stmt: OpaquePointer?
-        guard sqlite3_prepare_v2(db, sql, -1, &stmt, nil) == SQLITE_OK else {
-            return Result(columns: [], rows: [], error: String(cString: sqlite3_errmsg(db)), rowsAffected: 0)
+        var prepareError: String?
+        var trailingStatement = false
+        sql.withCString { (base: UnsafePointer<CChar>) in
+            var tail: UnsafePointer<CChar>?
+            guard sqlite3_prepare_v2(db, base, -1, &stmt, &tail) == SQLITE_OK else {
+                prepareError = String(cString: sqlite3_errmsg(db))
+                return
+            }
+            // Trailing whitespace/comments are fine; anything that compiles to (or
+            // fails as) another statement is not.
+            if let tail, tail.pointee != 0 {
+                var rest: OpaquePointer?
+                if sqlite3_prepare_v2(db, tail, -1, &rest, nil) == SQLITE_OK {
+                    if rest != nil { trailingStatement = true }
+                } else {
+                    trailingStatement = true
+                }
+                if let rest { sqlite3_finalize(rest) }
+            }
         }
+        if let prepareError {
+            if let stmt { sqlite3_finalize(stmt) }
+            return Result(columns: [], rows: [], error: prepareError, rowsAffected: 0)
+        }
+        guard let stmt else { return Result(columns: [], rows: [], error: nil, rowsAffected: 0) }
         defer { sqlite3_finalize(stmt) }
+        guard !trailingStatement else {
+            return Result(columns: [], rows: [],
+                          error: "SQL contains more than one statement — execute() runs exactly one; use run() for scripts",
+                          rowsAffected: 0)
+        }
 
         let expected = Int(sqlite3_bind_parameter_count(stmt))
         guard parameters.count == expected else {
@@ -189,7 +249,7 @@ public final class SQLiteDB {
                 return Result(columns: [], rows: [], error: String(cString: sqlite3_errmsg(db)), rowsAffected: 0)
             }
         }
-        return collect(stmt!, on: db, limit: limit)
+        return collect(stmt, on: db, limit: limit)
     }
 
     /// The rowid of the most recent successful `INSERT` on this connection
@@ -217,7 +277,15 @@ public final class SQLiteDB {
                 case SQLITE_INTEGER: row.append(String(sqlite3_column_int64(stmt, c)))
                 case SQLITE_FLOAT:   row.append(String(sqlite3_column_double(stmt, c)))
                 case SQLITE_BLOB:    row.append("‹blob \(sqlite3_column_bytes(stmt, c))b›")
-                default:             row.append(sqlite3_column_text(stmt, c).map { String(cString: $0) } ?? "")
+                default:
+                    // Decode the full column_bytes length — String(cString:) would
+                    // silently truncate TEXT at an embedded NUL.
+                    if let ptr = sqlite3_column_text(stmt, c) {
+                        let count = Int(sqlite3_column_bytes(stmt, c))
+                        row.append(String(decoding: UnsafeBufferPointer(start: ptr, count: count), as: UTF8.self))
+                    } else {
+                        row.append("")
+                    }
                 }
             }
             rows.append(row)

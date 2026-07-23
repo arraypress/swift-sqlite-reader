@@ -185,6 +185,45 @@ final class SQLiteReaderTests: XCTestCase {
         XCTAssertEqual(db.lastInsertRowID, 2)
     }
 
+    // Regression: run() prepared only the first statement and silently dropped the rest.
+    func testRunExecutesEveryStatementInAScript() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (n); INSERT INTO t VALUES (1),(2);"))
+        let r = db.run("UPDATE t SET n = 9 WHERE n = 2; SELECT n FROM t ORDER BY n")
+        XCTAssertNil(r.error)
+        XCTAssertEqual(r.columns, ["n"])                       // the SELECT's shape wins
+        XCTAssertEqual(r.rows.map { $0[0] }, ["1", "9"])       // the UPDATE ran first
+        XCTAssertEqual(r.rowsAffected, 1)                      // writes are totalled
+
+        let two = db.run("SELECT 1; SELECT 2")
+        XCTAssertNil(two.error)
+        XCTAssertEqual(two.rows, [["2"]])                      // last result-producing statement
+    }
+
+    func testRunScriptStopsAtFirstError() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (n);"))
+        let r = db.run("INSERT INTO t VALUES (1); SELECT * FROM nope; INSERT INTO t VALUES (2)")
+        XCTAssertNotNil(r.error)
+        XCTAssertEqual(db.rowCount("t"), 1)                    // nothing after the error ran
+    }
+
+    // Regression: execute() silently ignored statements after the first.
+    func testExecuteRejectsTrailingStatements() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (n);"))
+        let r = db.execute("INSERT INTO t VALUES (?); DROP TABLE t", parameters: [.integer(1)])
+        XCTAssertNotNil(r.error)
+        XCTAssertEqual(db.tables(), ["t"])                     // neither statement ran
+        XCTAssertEqual(db.rowCount("t"), 0)
+        // Trailing whitespace/comments are still fine.
+        XCTAssertNil(db.execute("INSERT INTO t VALUES (?);  -- done", parameters: [.integer(1)]).error)
+    }
+
+    // Regression: TEXT with an embedded NUL was truncated at the NUL by String(cString:).
+    func testTextWithEmbeddedNULIsNotTruncated() throws {
+        let db = try XCTUnwrap(SQLiteDB(sql: "CREATE TABLE t (b);"))
+        XCTAssertNil(db.run("INSERT INTO t VALUES (char(104,0,105))").error)   // 'h\0i'
+        XCTAssertEqual(db.run("SELECT b FROM t").rows.first?.first, "h\u{0}i")
+    }
+
     func testQuoteIdentifierEscapesEmbeddedQuotes() {
         XCTAssertEqual(SQLiteDB.quoteIdentifier("plain"), "\"plain\"")
         XCTAssertEqual(SQLiteDB.quoteIdentifier(#"we"ird"#), #""we""ird""#)
