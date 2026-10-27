@@ -33,4 +33,20 @@ public extension SQLiteValue {
 
     /// A 16-byte blob as a UUID string; nil otherwise.
     var uuid: String? { data.flatMap(ValueReading.uuid) }
+
+    /// The value as an integer, a real truncated toward zero; nil for NULL and anything else.
+    /// Apps store whole numbers as reals; this is how their own code reads them.
+    var truncatedInt: Int? { int ?? double.flatMap { Int(exactly: $0.rounded(.towardZero)) } }
+
+    /// The value as a string, a blob read as UTF-8 — apps store text as either.
+    var decodedString: String? {
+        if case .blob(let bytes) = self { return String(decoding: bytes, as: UTF8.self) }
+        return string
+    }
+
+    /// ``decodedString``, or nil when it is empty.
+    var nonEmptyString: String? { decodedString.flatMap { $0.isEmpty ? nil : $0 } }
+
+    /// ``data``, or nil when it is empty.
+    var nonEmptyData: Data? { data.flatMap { $0.isEmpty ? nil : $0 } }
 }

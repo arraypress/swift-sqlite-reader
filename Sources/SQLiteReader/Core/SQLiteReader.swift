@@ -37,9 +37,10 @@ public final class SQLiteReader {
     /// - Parameters:
     ///   - path: The store.
     ///   - opening: In place read-only, or a private copy (see ``SQLiteOpening``).
+    ///   - busyTimeout: How long a query waits for a lock its app holds, seconds; 0 fails at once.
     /// - Throws: ``SQLiteReaderError/notFound(_:)``, ``SQLiteReaderError/permissionDenied(_:)`` or
     ///   ``SQLiteReaderError/unreadable(_:reason:)``.
-    public init(path: URL, opening: SQLiteOpening = .readOnly) throws(SQLiteReaderError) {
+    public init(path: URL, opening: SQLiteOpening = .readOnly, busyTimeout: TimeInterval = 0) throws(SQLiteReaderError) {
         self.path = path.path
         switch FileChecks.access(path.path) {
         case .readable: break
@@ -61,11 +62,13 @@ public final class SQLiteReader {
                 throw error
             }
         }
-        // A protected store can open and still refuse its first read.
+        if busyTimeout > 0 { sqlite3_busy_timeout(handle, Int32(min(busyTimeout * 1000, Double(Int32.max)))) }
+        // A protected store can open and still refuse its first read; a file
+        // that is not a database fails it too, and says so.
         do { _ = try rows("SELECT count(*) FROM sqlite_master") } catch {
             sqlite3_close_v2(handle)
             if let copy { try? FileManager.default.removeItem(at: copy) }
-            throw .permissionDenied(path.path)
+            throw FirstRead.failure(error, path: path.path)
         }
     }
 
